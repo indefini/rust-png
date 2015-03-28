@@ -1,8 +1,10 @@
 #![feature(collections, io, os, path)]
 
-use std::old_io::Command;
-use std::old_io::process::InheritFd;
+use std::process::Command;
+use std::path::Path;
+use std::env;
 use std::os;
+use std::io::ErrorKind;
 
 fn main() {
     let target = os::getenv("TARGET").unwrap();
@@ -15,8 +17,11 @@ fn main() {
         os::setenv("AR", ar);
     }
 
-    let cfg = Path::new(os::getenv("CARGO_MANIFEST_DIR").unwrap()).join("libpng-1.6.16/configure");
-    let dst = Path::new(os::getenv("OUT_DIR").unwrap());
+    let cmd = env::var("CARGO_MANIFEST_DIR").ok().expect("cargo dir");
+    let cfg = Path::new(&cmd).join("libpng-1.6.16/configure");
+
+    let od = env::var("OUT_DIR").ok().expect("out dir");
+    let dst = Path::new(&od);
 
     os::setenv("CFLAGS", "-fPIC -O3");
 
@@ -25,12 +30,12 @@ fn main() {
     if is_android {
         cmd.arg("--host=arm-linux-gnueabi");
     }
-    cmd.cwd(&dst);
+    cmd.current_dir(&dst);
     run(&mut cmd);
 
     let mut cmd = Command::new("make");
     cmd.arg("-j4");
-    cmd.cwd(&dst);
+    cmd.current_dir(&dst);
     run(&mut cmd);
 
     println!("cargo:root={}", dst.display());
@@ -39,9 +44,18 @@ fn main() {
 
 fn run(cmd: &mut Command) {
     println!("running: {:?}", cmd);
-    assert!(cmd.stdout(InheritFd(1))
-               .stderr(InheritFd(2))
-               .status()
-               .unwrap()
-               .success());
+    let status = match cmd.status() {
+        Ok(status) => status,
+        Err(ref e) if e.kind() == ErrorKind::NotFound => {
+            fail(&format!("failed to execute command: {}", e));
+        }
+        Err(e) => fail(&format!("failed to execute command: {}", e)),
+    };
+    if !status.success() {
+        fail(&format!("command did not execute successfully, got: {}", status));
+    }
+}
+
+fn fail(s: &str) -> ! {
+    panic!("\n{}\n\nbuild script failed, must exit now", s)
 }

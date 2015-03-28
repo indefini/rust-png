@@ -10,7 +10,7 @@
 #![crate_name = "png"]
 #![crate_type = "rlib"]
 
-#![feature(core, io, libc, path)]
+#![feature(core, io, libc, path, convert)]
 
 extern crate libc;
 
@@ -19,7 +19,7 @@ use std::mem;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::iter::repeat;
-use std::path::AsPath;
+use std::path::Path;
 use std::ptr;
 use std::slice;
 
@@ -66,7 +66,7 @@ pub extern fn read_data(png_ptr: *mut ffi::png_struct, data: *mut u8, length: si
     }
 }
 
-pub fn load_png<P: AsPath>(path: P) -> Result<Image, String> {
+pub fn load_png<P: AsRef<Path>>(path: P) -> Result<Image, String> {
     let mut reader = match File::open(path) {
         Ok(r) => r,
         Err(e) => return Err(format!("could not open file: {}", e.description())),
@@ -191,7 +191,7 @@ pub extern fn flush_data(png_ptr: *mut ffi::png_struct) {
     }
 }
 
-pub fn store_png<P: AsPath>(img: &mut Image, path: P) -> Result<(),String> {
+pub fn store_png<P: AsRef<Path>>(img: &mut Image, path: P) -> Result<(),String> {
     let mut file = match File::create(path) {
         Ok(f) => f,
         Err(e) => return Err(format!("{}", e))
