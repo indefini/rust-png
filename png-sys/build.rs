@@ -1,61 +1,65 @@
-#![feature(collections, io, os, path)]
+use std::env;
+use std::path::PathBuf;
 
 use std::process::Command;
-use std::path::Path;
-use std::env;
-use std::os;
-use std::io::ErrorKind;
+use std::process::Stdio;
 
 fn main() {
-    let target = os::getenv("TARGET").unwrap();
-    let is_android = target.find_str("android").is_some();
+    let target = env::var("TARGET").unwrap();
+    let host = env::var("HOST").unwrap();
 
-    if is_android {
-        let cc = format!("{}-gcc", target);
-        let ar = format!("{}-ar", target);
-        os::setenv("CC", cc);
-        os::setenv("AR", ar);
+    if host != target {
+        if env::var_os("CC").is_none() {
+            env::set_var("CC", format!("{}-gcc", target));
+        }
+        if env::var_os("AR").is_none() {
+            env::set_var("AR", format!("{}-ar", target));
+        }
+        if env::var_os("RANLIB").is_none() {
+            env::set_var("RANLIB", format!("{}-ranlib", target));
+        }
     }
 
-    let cmd = env::var("CARGO_MANIFEST_DIR").ok().expect("cargo dir");
-    let cfg = Path::new(&cmd).join("libpng-1.6.16/configure");
+    let cfg = PathBuf::from(&env::var("CARGO_MANIFEST_DIR")
+                            .unwrap()).join("libpng-1.6.16/configure");
+    let dst = PathBuf::from(&env::var("OUT_DIR").unwrap());
+    env::set_var("CFLAGS", "-fPIC -O3");
+    let mut cmd;
+    if host.find("windows").is_some() {
+        // Here be windows hacks
 
-    let od = env::var("OUT_DIR").ok().expect("out dir");
-    let dst = Path::new(&od);
+        // Windows doesn't know how to handle executables
+        // with shebangs, so we pass it through `sh`
+        cmd = Command::new(PathBuf::from("sh"));
 
-    os::setenv("CFLAGS", "-fPIC -O3");
-
-    let mut cmd = Command::new(cfg);
-    cmd.arg("--with-libpng-prefix=RUST_");
-    if is_android {
-        cmd.arg("--host=arm-linux-gnueabi");
+        // Windows under mingw also doesn't understand its
+        // own paths, so we pass the path through cygpath
+        cmd.arg("-c").arg(&format!("$(cygpath \"{}\") --with-libpng-prefix=RUST_",
+                                   cfg.to_str().unwrap()));
+    } else {
+        cmd = Command::new(cfg);
+        cmd.arg("--with-libpng-prefix=RUST_");
+        if host != target {
+            cmd.arg(format!("--host={}", target));
+        }
     }
     cmd.current_dir(&dst);
     run(&mut cmd);
-
     let mut cmd = Command::new("make");
     cmd.arg("-j4");
     cmd.current_dir(&dst);
     run(&mut cmd);
 
     println!("cargo:root={}", dst.display());
-    println!("cargo:rustc-flags=-l png16:static -L {}/.libs", dst.display());
+    println!("cargo:rustc-link-search=native={}/.libs", dst.display());
+    println!("cargo:rustc-link-lib=static=png16");
 }
 
 fn run(cmd: &mut Command) {
     println!("running: {:?}", cmd);
-    let status = match cmd.status() {
-        Ok(status) => status,
-        Err(ref e) if e.kind() == ErrorKind::NotFound => {
-            fail(&format!("failed to execute command: {}", e));
-        }
-        Err(e) => fail(&format!("failed to execute command: {}", e)),
-    };
-    if !status.success() {
-        fail(&format!("command did not execute successfully, got: {}", status));
-    }
-}
-
-fn fail(s: &str) -> ! {
-    panic!("\n{}\n\nbuild script failed, must exit now", s)
+    assert!(cmd.stdout(Stdio::inherit())
+               .stderr(Stdio::inherit())
+               .status()
+               .unwrap()
+               .success());
 }

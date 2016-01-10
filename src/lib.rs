@@ -9,23 +9,28 @@
 
 #![crate_name = "png"]
 #![crate_type = "rlib"]
-
-#![feature(core, io, libc, path, convert)]
+#![cfg_attr(feature="serde-serialization", feature(custom_derive, plugin))]
+#![cfg_attr(feature="serde-serialization", plugin(serde_macros))]
 
 extern crate libc;
+extern crate png_sys;
+
+#[cfg(feature="serde-serialization")]
+extern crate serde;
 
 use libc::{c_int, size_t};
-use std::mem;
+use std::error::Error;
 use std::fs::File;
 use std::io::{Read, Write};
 use std::iter::repeat;
+use std::mem;
 use std::path::Path;
 use std::ptr;
 use std::slice;
 
 pub mod ffi;
 
-
+#[cfg_attr(feature="serde-serialization", derive(Deserialize, Serialize))]
 pub enum PixelsByColorType {
     K8(Vec<u8>),
     KA8(Vec<u8>),
@@ -33,6 +38,7 @@ pub enum PixelsByColorType {
     RGBA8(Vec<u8>),
 }
 
+#[cfg_attr(feature="serde-serialization", derive(Deserialize, Serialize))]
 pub struct Image {
     pub width: u32,
     pub height: u32,
@@ -61,7 +67,7 @@ pub extern fn read_data(png_ptr: *mut ffi::png_struct, data: *mut u8, length: si
         let buf = slice::from_raw_parts_mut(data, len);
         let end_pos = std::cmp::min(image_data.data.len()-image_data.offset, len);
         let src = &image_data.data[image_data.offset..image_data.offset+end_pos];
-        ptr::copy(buf.as_mut_ptr(), src.as_ptr(), src.len());
+        ptr::copy(src.as_ptr(), buf.as_mut_ptr(), src.len());
         image_data.offset += end_pos;
     }
 }
@@ -245,15 +251,79 @@ pub fn store_png<P: AsRef<Path>>(img: &mut Image, path: P) -> Result<(),String> 
     Ok(())
 }
 
+pub extern fn write_data_to_buf(png_ptr: *mut ffi::png_struct, data: *mut u8, length: size_t) {
+    unsafe {
+        let io_ptr = ffi::RUST_png_get_io_ptr(png_ptr);
+        let dest: &mut Vec<u8> = mem::transmute(io_ptr);
+        dest.reserve_exact(length as usize);
+        let buf = slice::from_raw_parts(data as *const _, length as usize);
+        for x in buf {
+            dest.push(*x);
+        }
+    }
+}
+
+pub extern fn flush_data_to_buf(_png_ptr: *mut ffi::png_struct) {}
+
+//TODO: This should share most of the implementation with store_png
+pub fn to_vec(img: &mut Image) -> Result<Vec<u8>,String> {
+    let target: Vec<u8> = Vec::new();
+
+    unsafe {
+        let mut png_ptr = ffi::RUST_png_create_write_struct(&*ffi::RUST_png_get_header_ver(ptr::null_mut()),
+                                                       ptr::null_mut(),
+                                                       ptr::null_mut(),
+                                                       ptr::null_mut());
+        if png_ptr.is_null() {
+            return Err("could not create write struct".to_string());
+        }
+        let mut info_ptr = ffi::RUST_png_create_info_struct(png_ptr);
+        if info_ptr.is_null() {
+            ffi::RUST_png_destroy_write_struct(&mut png_ptr, ptr::null_mut());
+            return Err("could not create info struct".to_string());
+        }
+        let res = ffi::setjmp(ffi::pngshim_jmpbuf(png_ptr));
+        if res != 0 {
+            ffi::RUST_png_destroy_write_struct(&mut png_ptr, &mut info_ptr);
+            return Err("error writing png".to_string());
+        }
+
+        ffi::RUST_png_set_write_fn(png_ptr, mem::transmute(&target),
+                                   write_data_to_buf, flush_data_to_buf);
+
+        let (bit_depth, color_type, pixel_width, image_buf) = match img.pixels {
+            PixelsByColorType::RGB8(ref mut pixels) => (8, ffi::COLOR_TYPE_RGB, 3, pixels.as_mut_ptr()),
+            PixelsByColorType::RGBA8(ref mut pixels) => (8, ffi::COLOR_TYPE_RGBA, 4, pixels.as_mut_ptr()),
+            PixelsByColorType::K8(ref mut pixels) => (8, ffi::COLOR_TYPE_GRAY, 1, pixels.as_mut_ptr()),
+            PixelsByColorType::KA8(ref mut pixels) => (8, ffi::COLOR_TYPE_GA, 2, pixels.as_mut_ptr()),
+        };
+
+        ffi::RUST_png_set_IHDR(png_ptr, info_ptr, img.width, img.height, bit_depth, color_type,
+                          ffi::INTERLACE_NONE, ffi::COMPRESSION_TYPE_DEFAULT, ffi::FILTER_NONE);
+
+        let mut row_pointers: Vec<*mut u8> = (0..img.height as usize).map(|idx| {
+            image_buf.offset((((img.width * pixel_width) as usize) * idx) as isize)
+        }).collect();
+        ffi::RUST_png_set_rows(png_ptr, info_ptr, row_pointers.as_mut_ptr());
+
+        ffi::RUST_png_write_png(png_ptr, info_ptr, ffi::TRANSFORM_IDENTITY, ptr::null_mut());
+
+        ffi::RUST_png_destroy_write_struct(&mut png_ptr, &mut info_ptr);
+    }
+
+    Ok(target)
+}
+
 #[cfg(test)]
 mod test {
-    extern crate test;
+    use std::error::Error;
     use std::fs::File;
     use std::io::Read;
     use std::iter::repeat;
+    use std::path::PathBuf;
 
-    use super::{ffi, load_png, load_png_from_memory, store_png, Image};
-    use super::PixelsByColorType::{RGB8, RGBA8, K8, KA8};
+    use super::{ffi, load_png, store_png, to_vec, Image};
+    use super::PixelsByColorType::{RGB8, RGBA8};
 
     #[test]
     fn test_valid_png() {
@@ -272,7 +342,7 @@ mod test {
     }
 
     fn load_rgba8(file: &'static str, w: u32, h: u32) {
-        match load_png(&Path::new(file)) {
+        match load_png(&PathBuf::from(file)) {
             Err(m) => panic!(m),
             Ok(image) => {
                 assert_eq!(image.width, w);
@@ -299,49 +369,51 @@ mod test {
         load_rgba8("test/gray.png", 100, 100);
     }
 
-    fn bench_file_from_memory(b: &mut test::Bencher, file: &'static str,
-                              w: u32, h: u32, c: &'static str) {
-        let mut reader = match File::open(file) {
-            Ok(r) => r,
-            Err(e) => panic!("could not open '{}': {}", file, e.description())
-        };
-        let mut buf = vec![];
-        match reader.read_to_end(&mut buf) {
-            Ok(_) => (),
-            Err(e) => panic!(e)
-        }
-        b.bench_n(1, |b| b.iter(|| {
-            match load_png_from_memory(buf.as_slice()) {
-                Err(m) => panic!(m),
-                Ok(image) => {
-                    let color_type = match image.pixels {
-                        K8(_) => "K8",
-                        KA8(_) => "KA8",
-                        RGB8(_) => "RGB8",
-                        RGBA8(_) => "RGBA8",
-                    };
-                    assert_eq!(color_type, c);
-                    assert_eq!(image.width, w);
-                    assert_eq!(image.height, h);
-                }
-            }
-        }));
-    }
-
-    #[bench]
-    fn test_load_perf_screenshot(b: &mut test::Bencher) {
-        bench_file_from_memory(b, "test/servo-screenshot.png", 831, 624, "RGBA8");
-    }
-
-    #[bench]
-    fn test_load_perf_dino(b: &mut test::Bencher) {
-        bench_file_from_memory(b, "test/mozilla-dinosaur-head-logo.png", 1300, 929, "RGBA8");
-    }
-
-    #[bench]
-    fn test_load_perf_rust(b: &mut test::Bencher) {
-        bench_file_from_memory(b, "test/rust-huge-logo.png", 4000, 4000, "RGBA8");
-    }
+    // // test::Bencher is unstable in beta, so these are commented out for the time being.
+    //
+    // fn bench_file_from_memory(b: &mut test::Bencher, file: &'static str,
+    //                           w: u32, h: u32, c: &'static str) {
+    //     let mut reader = match File::open(file) {
+    //         Ok(r) => r,
+    //         Err(e) => panic!("could not open '{}': {}", file, e.description())
+    //     };
+    //     let mut buf = vec![];
+    //     match reader.read_to_end(&mut buf) {
+    //         Ok(_) => (),
+    //         Err(e) => panic!(e)
+    //     }
+    //     b.bench_n(1, |b| b.iter(|| {
+    //         match load_png_from_memory(buf.as_slice()) {
+    //             Err(m) => panic!(m),
+    //             Ok(image) => {
+    //                 let color_type = match image.pixels {
+    //                     K8(_) => "K8",
+    //                     KA8(_) => "KA8",
+    //                     RGB8(_) => "RGB8",
+    //                     RGBA8(_) => "RGBA8",
+    //                 };
+    //                 assert_eq!(color_type, c);
+    //                 assert_eq!(image.width, w);
+    //                 assert_eq!(image.height, h);
+    //             }
+    //         }
+    //     }));
+    // }
+    //
+    // #[bench]
+    // fn test_load_perf_screenshot(b: &mut test::Bencher) {
+    //     bench_file_from_memory(b, "test/servo-screenshot.png", 831, 624, "RGBA8");
+    // }
+    //
+    // #[bench]
+    // fn test_load_perf_dino(b: &mut test::Bencher) {
+    //     bench_file_from_memory(b, "test/mozilla-dinosaur-head-logo.png", 1300, 929, "RGBA8");
+    // }
+    //
+    // #[bench]
+    // fn test_load_perf_rust(b: &mut test::Bencher) {
+    //     bench_file_from_memory(b, "test/rust-huge-logo.png", 4000, 4000, "RGBA8");
+    // }
 
     #[test]
     fn test_store() {
@@ -350,7 +422,29 @@ mod test {
             height: 10,
             pixels: RGB8(repeat(100).take(10 * 10 * 3).collect()),
         };
-        let res = store_png(&mut img, &Path::new("test/store.png"));
+        let res = store_png(&mut img, &PathBuf::from("test/store.png"));
         assert!(res.is_ok());
+    }
+
+    #[test]
+    fn test_to_vec() {
+        let mut img = Image {
+            width: 10,
+            height: 10,
+            pixels: RGB8(repeat(100).take(10 * 10 * 3).collect()),
+        };
+        let res = to_vec(&mut img);
+        assert!(res.is_ok());
+        let data = res.unwrap();
+
+        // Check the PNG header
+        assert!(data[..8] == *b"\x89\x50\x4E\x47\x0D\x0A\x1A\x0A");
+
+        let path = PathBuf::from("test/to_vec.png");
+        let res = store_png(&mut img, &path);
+        assert!(res.is_ok());
+        let mut expected: Vec<u8> = Vec::with_capacity(data.len());
+        File::open(&path).unwrap().read_to_end(&mut expected).unwrap();
+        assert_eq!(data, expected);
     }
 }
