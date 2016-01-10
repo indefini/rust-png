@@ -12,7 +12,7 @@ build = "build.rs"
 path = "png-sys"
 
 [dependencies]
-libc = "0.1.5"
+libc = "*"
 
 [dependencies.serde]
 version = "*"
